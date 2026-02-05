@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-#/ Git helper that lets you describe what you want to do in natural language.
-#/
-#/ Usage: $(basename "$0") [-h] [-v] [free-form git request]
-#/
-#/ Available options:
-#/    -h, --help      Print this help and exit
-#/    -v, --verbose   Enable verbose output
-#/
-#/ Examples:
-#/    $(basename "$0") "undo last commit (already pushed to origin) then
-#/              unstage all files"
-#/
-#/ Environment:
-#/    OPENAI_API_KEY    API key used to call OpenAI (required)
-#/    GIX_OPENAI_API_KEY Alternate env var for the API key (optional)
-#/    OPENAI_API_BASE   Override the OpenAI API base URL (optional)
-#/    GIX_OPENAI_MODEL  Override the OpenAI model name (optional)
+# / Git helper that lets you describe what you want to do in natural language.
+# /
+# / Usage: $(basename "$0") [-h] [-v] [free-form git request]
+# /
+# / Available options:
+# /    -h, --help      Print this help and exit
+# /    -v, --verbose   Enable verbose output
+# /
+# / Examples:
+# /    $(basename "$0") "undo last commit (already pushed to origin) then
+# /              unstage all files"
+# /
+# / Environment:
+# /    OPENAI_API_KEY    API key used to call OpenAI (required)
+# /    GIX_OPENAI_API_KEY Alternate env var for the API key (optional)
+# /    OPENAI_API_BASE   Override the OpenAI API base URL (optional)
+# /    GIX_OPENAI_MODEL  Override the OpenAI model name (optional)
 
 import argparse
 import json
@@ -231,6 +231,31 @@ def confirm_execution() -> bool:
     return reply.lower() == "y" or reply.lower() == ""
 
 
+def add_to_bash_history(commands: str, logger: Logger) -> None:
+    """Add commands to bash history file."""
+    histfile = os.environ.get("HISTFILE", os.path.expanduser("~/.bash_history"))
+
+    # Skip if HISTFILE is set to /dev/null or empty
+    if not histfile or histfile == "/dev/null":
+        logger.debug("HISTFILE is disabled, skipping history append")
+        return
+
+    try:
+        # Get the parent shell's PID to determine if we should append
+        # We'll append to the history file directly
+        with open(histfile, "a", encoding="utf-8") as f:
+            for line in commands.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    # Format: timestamp (optional) + command
+                    # Bash history format is just the command, one per line
+                    f.write(f"{line}\n")
+        logger.debug(f"Added commands to {histfile}")
+    except (IOError, OSError) as exc:
+        # Silently fail if we can't write to history
+        logger.debug(f"Could not append to history file: {exc}")
+
+
 def execute_commands(commands: str, logger: Logger) -> None:
     require_binary("bash", logger)
     with tempfile.NamedTemporaryFile(
@@ -272,11 +297,9 @@ def main(argv: List[str]) -> int:
         logger.error("No request provided")
         return 1
 
-    print(f"\033[2;3mResearching how to \"{instruction}\"...\033[0m")
+    print(f'\033[2;3mResearching how to "{instruction}"...\033[0m')
 
-    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get(
-        "GIX_OPENAI_API_KEY"
-    )
+    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("GIX_OPENAI_API_KEY")
     if not api_key:
         logger.error("OPENAI_API_KEY (or GIX_OPENAI_API_KEY) must be set")
         return 1
@@ -298,6 +321,7 @@ def main(argv: List[str]) -> int:
     if not confirm_execution():
         return 0
 
+    add_to_bash_history(commands, logger)
     execute_commands(commands, logger)
     return 0
 

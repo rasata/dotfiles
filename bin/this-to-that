@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+#/ Best-quality file format conversions powered by ffmpeg.
+#/
+#/ Usage: $(basename "$0") [-h] [-v] <input> <output> [-- extra_ffmpeg_args...]
+#/
+#/ Available options:
+#/    -h, --help      Print this help and exit
+#/    -v, --verbose   Enable verbose output
+#/
+#/ Supported conversions:
+#/    Audio:  mp3, aac, m4a, wav, flac, ogg, opus, wma, alac
+#/    Video:  mp4, mov, mkv, webm, avi, m4v, mpg, mpeg, ts, m2ts
+#/    Image:  jpg, jpeg, png, webp, gif, bmp, tif, tiff, heic, avif
+#/    Docs:   pdf, txt, md, html, csv (requires pandoc/libreoffice/jq)
+#/
+#/ Examples:
+#/    $(basename "$0") input.mp4 output.mov
+#/    $(basename "$0") song.wav song.mp3
+#/    $(basename "$0") clip.mp4 audio.flac
+#/    $(basename "$0") video.mp4 video.gif
+#/    $(basename "$0") image.png image.webp -- -compression_level 6
+
+set -Eeuo pipefail
+trap script.cleanup SIGINT SIGTERM ERR EXIT
+
+source "$(dirname "$0")/../lib/bash/initrc"
+
+verbose=0
+declare -a EXTRA_FFMPEG_ARGS=()
+IN=""
+OUT=""
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    -h | --help) script.usage ;;
+    -v | --verbose) verbose=1 ;;
+    --)
+      shift
+      EXTRA_FFMPEG_ARGS=("$@")
+      return 0
+      ;;
+    -*)
+      log.error "Unknown option: $1"
+      script.usage 1
+      ;;
+    *)
+      if [[ -z $IN ]]; then
+        IN="$1"
+      elif [[ -z $OUT ]]; then
+        OUT="$1"
+      else
+        log.error "Unexpected argument: $1"
+        script.usage 1
+      fi
+      ;;
+    esac
+    shift
+  done
+
+  [[ -n $IN && -n $OUT ]] || {
+    log.error "Both <input> and <output> are required"
+    script.usage 1
+  }
+}
+
+ext_of() {
+  path.suffix "$1" | str.lower | sed 's/^\.//'
+}
+
+mime_hint() {
+  if command -v file >/dev/null 2>&1 && [[ -f $1 ]]; then
+    file --brief --mime-type "$1" 2>/dev/null || true
+  fi
+}
+
+is_video_ext() {
+  case "$1" in
+  mp4 | mov | mkv | webm | avi | m4v | mpg | mpeg | ts | m2ts) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+is_audio_ext() {
+  case "$1" in
+  mp3 | aac | m4a | wav | flac | ogg | opus | wma | alac) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+is_image_ext() {
+  case "$1" in
+  jpg | jpeg | png | webp | gif | bmp | tif | tiff | heic | avif | svg) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+is_doc_ext() {
+  case "$1" in
+  pdf | txt | md | html | rtf | docx | odt | pptx | xlsx | csv | json | xml | yaml | yml) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+ensure_out_dir() {
+  local d
+  d="$(path.parent "$OUT")"
+  [[ "$d" == "." ]] || path.mkdir -p "$d"
+}
+
+run_ffmpeg() {
+  guards.require_exec ffmpeg
+  ensure_out_dir
+  ((verbose)) && log.info "ffmpeg $*"
+  ffmpeg -hide_banner -loglevel error -y "$@"
+}
+
+convert_to_audio() {
+  local acodec="" args=()
+  case "$OUT_EXT" in
+  flac) acodec="flac"; args=(-compression_level 0) ;;
+  wav) acodec="pcm_s24le" ;;
+  alac) acodec="alac" ;;
+  mp3) acodec="libmp3lame"; args=(-q:a 0) ;;
+  aac | m4a) acodec="aac"; args=(-q:a 1) ;;
+  opus) acodec="libopus"; args=(-b:a 256k) ;;
+  ogg) acodec="libvorbis"; args=(-q:a 10) ;;
+  *) log.error "Audio output not supported: .$OUT_EXT"; exit 1 ;;
+  esac
+  run_ffmpeg -i "$IN" -vn -c:a "$acodec" "${args[@]}" "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+}
+
+convert_to_video() {
+  local vcodec="" acodec="" args=()
+  case "$OUT_EXT" in
+  mp4 | m4v)
+    vcodec="libx264"; acodec="aac"
+    args=(-pix_fmt yuv420p -crf 16 -preset slow -movflags +faststart -profile:v high -level 4.2)
+    ;;
+  mov)
+    vcodec="prores_ks"; acodec="pcm_s24le"
+    args=(-profile:v 3 -pix_fmt yuv422p10le)
+    ;;
+  mkv)
+    vcodec="libx264"; acodec="flac"
+    args=(-pix_fmt yuv420p -crf 16 -preset slow)
+    ;;
+  webm)
+    vcodec="libvpx-vp9"; acodec="libopus"
+    args=(-crf 15 -b:v 0 -row-mt 1)
+    ;;
+  avi)
+    vcodec="ffv1"; acodec="pcm_s24le"
+    ;;
+  mpg | mpeg)
+    vcodec="mpeg2video"; acodec="pcm_s16le"
+    args=(-q:v 1)
+    ;;
+  ts | m2ts)
+    vcodec="libx264"; acodec="aac"
+    args=(-pix_fmt yuv420p -crf 16 -preset slow)
+    ;;
+  *) log.error "Video output not supported: .$OUT_EXT"; exit 1 ;;
+  esac
+  run_ffmpeg -i "$IN" -c:v "$vcodec" -c:a "$acodec" "${args[@]}" "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+}
+
+convert_to_image() {
+  case "$OUT_EXT" in
+  png)
+    run_ffmpeg -i "$IN" -compression_level 0 "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+    ;;
+  webp)
+    run_ffmpeg -i "$IN" -lossless 1 -compression_level 0 "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+    ;;
+  jpg | jpeg)
+    if is_video_ext "$IN_EXT" || [[ "$IN_MIME" == video/* ]]; then
+      run_ffmpeg -ss 0 -i "$IN" -frames:v 1 -q:v 1 "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+    else
+      run_ffmpeg -i "$IN" -q:v 1 "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+    fi
+    ;;
+  gif)
+    local vf="fps=15,scale=960:-1:flags=lanczos"
+    ensure_out_dir
+    guards.require_exec ffmpeg
+    ((verbose)) && log.info "Generating optimized GIF with palettegen"
+    ffmpeg -hide_banner -loglevel error -y -i "$IN" \
+      -vf "${vf},palettegen=stats_mode=full" /tmp/ttt_palette.png
+    ffmpeg -hide_banner -loglevel error -y -i "$IN" -i /tmp/ttt_palette.png \
+      -lavfi "${vf} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=3" \
+      "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+    rm -f /tmp/ttt_palette.png
+    ;;
+  tif | tiff)
+    run_ffmpeg -i "$IN" -compression_level 0 "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+    ;;
+  avif | heic)
+    run_ffmpeg -i "$IN" -q:v 1 "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+    ;;
+  svg)
+    log.error "SVG output not supported via ffmpeg; use inkscape or ImageMagick"
+    exit 1
+    ;;
+  *) log.error "Image output not supported: .$OUT_EXT"; exit 1 ;;
+  esac
+}
+
+convert_docs() {
+  ensure_out_dir
+  case "$OUT_EXT" in
+  pdf)
+    if [[ "$IN_EXT" =~ ^(md|html|htm|txt|rtf)$ ]]; then
+      guards.require_exec pandoc
+      ((verbose)) && log.info "Converting via pandoc"
+      pandoc "$IN" -o "$OUT"
+      return 0
+    elif [[ "$IN_EXT" == "svg" ]]; then
+      guards.require_exec inkscape
+      ((verbose)) && log.info "Converting via inkscape"
+      inkscape "$IN" --export-type=pdf --export-filename="$OUT" >/dev/null 2>&1
+      return 0
+    else
+      if command -v soffice >/dev/null 2>&1; then
+        local outdir produced
+        outdir="$(path.parent "$OUT")"
+        ((verbose)) && log.info "Converting via libreoffice"
+        soffice --headless --convert-to pdf --outdir "$outdir" "$IN" >/dev/null 2>&1
+        produced="$outdir/$(path.stem "$IN").pdf"
+        guards.require_file "$produced"
+        mv -f "$produced" "$OUT"
+        return 0
+      fi
+      if command -v unoconv >/dev/null 2>&1; then
+        unoconv -f pdf -o "$OUT" "$IN"
+        return 0
+      fi
+      log.error "No tool available for document->pdf (install pandoc, libreoffice, or unoconv)"
+      exit 1
+    fi
+    ;;
+  csv)
+    if [[ "$IN_EXT" == "json" ]]; then
+      guards.require_exec jq
+      ((verbose)) && log.info "Converting JSON to CSV via jq"
+      jq -r '
+        (.[0] | keys_unsorted) as $cols
+        | $cols,
+          map([.[ $cols[] ]] )[]
+        | @csv
+      ' "$IN" >"$OUT"
+      return 0
+    fi
+    if command -v ssconvert >/dev/null 2>&1; then
+      ssconvert "$IN" "$OUT" >/dev/null 2>&1
+      return 0
+    fi
+    log.error "No tool available for ->csv (install jq for JSON, or gnumeric ssconvert for spreadsheets)"
+    exit 1
+    ;;
+  md | html | txt)
+    guards.require_exec pandoc
+    ((verbose)) && log.info "Converting via pandoc"
+    pandoc "$IN" -o "$OUT"
+    ;;
+  *)
+    log.error "Document output not supported: .$OUT_EXT"
+    exit 1
+    ;;
+  esac
+}
+
+main() {
+  parse_args "$@"
+
+  guards.require_file "$IN"
+  [[ "$IN" != "$OUT" ]] || { log.error "Input and output are the same path"; exit 1; }
+
+  IN_EXT="$(ext_of "$IN")"
+  OUT_EXT="$(ext_of "$OUT")"
+  IN_MIME="$(mime_hint "$IN")"
+
+  if path.isdir "$OUT"; then
+    if [[ -n $OUT_EXT ]]; then
+      local parent base stem ext candidate i
+      parent="$(path.parent "$OUT")"
+      base="$(path.basename "$OUT")"
+      stem="$(path.stem "$base")"
+      ext="${OUT_EXT:-out}"
+      candidate="$(path.join "$parent" "${stem}.${ext}")"
+      i=1
+      while path.exists "$candidate"; do
+        candidate="$(path.join "$parent" "${stem}-${i}.${ext}")"
+        i=$((i + 1))
+      done
+      OUT="$candidate"
+      ((verbose)) && log.info "Output path is a directory; writing to $OUT"
+    else
+      local use_ext
+      use_ext="${IN_EXT:-out}"
+      OUT="$(path.join "$OUT" "$(path.stem "$IN").${use_ext}")"
+      ((verbose)) && log.info "Output is a directory; writing to $OUT"
+    fi
+  fi
+
+  guards.nonempty "$OUT_EXT" "output extension"
+
+  ((verbose)) && log.info "Converting $IN ($IN_EXT) -> $OUT ($OUT_EXT)"
+
+  if is_audio_ext "$OUT_EXT"; then
+    convert_to_audio
+  elif is_video_ext "$OUT_EXT"; then
+    convert_to_video
+  elif is_image_ext "$OUT_EXT"; then
+    convert_to_image
+  elif is_doc_ext "$OUT_EXT"; then
+    convert_docs
+  else
+    ((verbose)) && log.info "Unknown output type; falling back to ffmpeg"
+    run_ffmpeg -i "$IN" "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+  fi
+
+  log.success "Created $OUT"
+}
+
+main "$@"

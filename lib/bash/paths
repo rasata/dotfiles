@@ -57,7 +57,11 @@ path.join() {
 path.dirname() {
   local p
   p=$(path.strip_trailing_slashes "$1")
-  printf '%s\n' "${p%/*}"
+  if [[ "$p" != */* ]]; then
+    printf '%s\n' '.'
+  else
+    printf '%s\n' "${p%/*}"
+  fi
 }
 
 # path.basename PATH
