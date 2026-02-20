@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#/ Best-quality file format conversions powered by ffmpeg.
+#/ Best-quality file format conversions powered by ffmpeg (and friends).
 #/
 #/ Usage: $(basename "$0") [-h] [-v] <input> <output> [-- extra_ffmpeg_args...]
 #/
@@ -10,7 +10,8 @@
 #/ Supported conversions:
 #/    Audio:  mp3, aac, m4a, wav, flac, ogg, opus, wma, alac
 #/    Video:  mp4, mov, mkv, webm, avi, m4v, mpg, mpeg, ts, m2ts
-#/    Image:  jpg, jpeg, png, webp, gif, bmp, tif, tiff, heic, avif
+#/    Image:  jpg, jpeg, png, webp, gif, bmp, tif, tiff, heic, avif, svg (ai->svg via inkscape, pdf->image via poppler/imagemagick)
+#/    Fonts:  ttf, otf, woff, woff2, svg (requires fontforge)
 #/    Docs:   pdf, txt, md, html, csv (requires pandoc/libreoffice/jq)
 #/
 #/ Examples:
@@ -19,6 +20,7 @@
 #/    $(basename "$0") clip.mp4 audio.flac
 #/    $(basename "$0") video.mp4 video.gif
 #/    $(basename "$0") image.png image.webp -- -compression_level 6
+#/    $(basename "$0") scan.pdf page-1.png
 
 set -Eeuo pipefail
 trap script.cleanup SIGINT SIGTERM ERR EXIT
@@ -102,6 +104,13 @@ is_doc_ext() {
   esac
 }
 
+is_font_ext() {
+  case "$1" in
+  ttf | otf | woff | woff2 | svg) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
 ensure_out_dir() {
   local d
   d="$(path.parent "$OUT")"
@@ -127,7 +136,7 @@ convert_to_audio() {
   ogg) acodec="libvorbis"; args=(-q:a 10) ;;
   *) log.error "Audio output not supported: .$OUT_EXT"; exit 1 ;;
   esac
-  run_ffmpeg -i "$IN" -vn -c:a "$acodec" "${args[@]}" "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+  run_ffmpeg -i "$IN" -vn -c:a "$acodec" "${args[@]}" "${EXTRA_FFMPEG_ARGS[@]+"${EXTRA_FFMPEG_ARGS[@]}"}" "$OUT"
 }
 
 convert_to_video() {
@@ -162,22 +171,89 @@ convert_to_video() {
     ;;
   *) log.error "Video output not supported: .$OUT_EXT"; exit 1 ;;
   esac
-  run_ffmpeg -i "$IN" -c:v "$vcodec" -c:a "$acodec" "${args[@]}" "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+  run_ffmpeg -i "$IN" -c:v "$vcodec" -c:a "$acodec" "${args[@]}" "${EXTRA_FFMPEG_ARGS[@]+"${EXTRA_FFMPEG_ARGS[@]}"}" "$OUT"
 }
 
 convert_to_image() {
+  if [[ "$IN_EXT" == "pdf" || "$IN_MIME" == "application/pdf" ]]; then
+    local tmpdir tmpbase tmp_png
+    tmpdir="$(fs.mktmp dir ttt_pdf)" || {
+      log.error "Failed to create temporary directory for PDF conversion"
+      exit 1
+    }
+    tmpbase="$(path.join "$tmpdir" "page-1")"
+    tmp_png="${tmpbase}.png"
+
+    if command -v pdftocairo >/dev/null 2>&1; then
+      ((verbose)) && log.info "Rasterizing first PDF page via pdftocairo"
+      pdftocairo -png -singlefile -f 1 -l 1 -r 300 "$IN" "$tmpbase" >/dev/null 2>&1
+    elif command -v pdftoppm >/dev/null 2>&1; then
+      ((verbose)) && log.info "Rasterizing first PDF page via pdftoppm"
+      pdftoppm -png -singlefile -f 1 -l 1 -r 300 "$IN" "$tmpbase" >/dev/null 2>&1
+    elif command -v magick >/dev/null 2>&1; then
+      ((verbose)) && log.info "Rasterizing first PDF page via ImageMagick"
+      magick -density 300 "${IN}[0]" -background white -alpha remove "$tmp_png" >/dev/null 2>&1
+    else
+      rm -rf -- "$tmpdir"
+      log.error "PDF->image requires poppler (pdftocairo/pdftoppm) or ImageMagick (magick)"
+      exit 1
+    fi
+
+    guards.require_file "$tmp_png"
+
+    case "$OUT_EXT" in
+    png)
+      run_ffmpeg -i "$tmp_png" -compression_level 0 "${EXTRA_FFMPEG_ARGS[@]+"${EXTRA_FFMPEG_ARGS[@]}"}" "$OUT"
+      ;;
+    webp)
+      run_ffmpeg -i "$tmp_png" -lossless 1 -compression_level 0 "${EXTRA_FFMPEG_ARGS[@]+"${EXTRA_FFMPEG_ARGS[@]}"}" "$OUT"
+      ;;
+    jpg | jpeg)
+      run_ffmpeg -i "$tmp_png" -q:v 1 "${EXTRA_FFMPEG_ARGS[@]+"${EXTRA_FFMPEG_ARGS[@]}"}" "$OUT"
+      ;;
+    gif)
+      run_ffmpeg -loop 1 -i "$tmp_png" -frames:v 1 "${EXTRA_FFMPEG_ARGS[@]+"${EXTRA_FFMPEG_ARGS[@]}"}" "$OUT"
+      ;;
+    tif | tiff)
+      run_ffmpeg -i "$tmp_png" -compression_level 0 "${EXTRA_FFMPEG_ARGS[@]+"${EXTRA_FFMPEG_ARGS[@]}"}" "$OUT"
+      ;;
+    bmp | avif | heic)
+      run_ffmpeg -i "$tmp_png" -q:v 1 "${EXTRA_FFMPEG_ARGS[@]+"${EXTRA_FFMPEG_ARGS[@]}"}" "$OUT"
+      ;;
+    svg)
+      if command -v pdftocairo >/dev/null 2>&1; then
+        ensure_out_dir
+        ((verbose)) && log.info "Converting first PDF page to SVG via pdftocairo"
+        pdftocairo -svg -singlefile -f 1 -l 1 "$IN" "$OUT" >/dev/null 2>&1
+      else
+        rm -rf -- "$tmpdir"
+        log.error "PDF->svg requires pdftocairo (poppler)"
+        exit 1
+      fi
+      ;;
+    *)
+      rm -rf -- "$tmpdir"
+      log.error "Image output not supported: .$OUT_EXT"
+      exit 1
+      ;;
+    esac
+
+    rm -rf -- "$tmpdir"
+    return 0
+  fi
+
   case "$OUT_EXT" in
   png)
-    run_ffmpeg -i "$IN" -compression_level 0 "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+    run_ffmpeg -i "$IN" -compression_level 0 "${EXTRA_FFMPEG_ARGS[@]+"${EXTRA_FFMPEG_ARGS[@]}"}" "$OUT"
     ;;
   webp)
-    run_ffmpeg -i "$IN" -lossless 1 -compression_level 0 "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+    run_ffmpeg -i "$IN" -lossless 1 -compression_level 0 "${EXTRA_FFMPEG_ARGS[@]+"${EXTRA_FFMPEG_ARGS[@]}"}" "$OUT"
     ;;
   jpg | jpeg)
     if is_video_ext "$IN_EXT" || [[ "$IN_MIME" == video/* ]]; then
-      run_ffmpeg -ss 0 -i "$IN" -frames:v 1 -q:v 1 "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+      run_ffmpeg -ss 0 -i "$IN" -frames:v 1 -q:v 1 "${EXTRA_FFMPEG_ARGS[@]+"${EXTRA_FFMPEG_ARGS[@]}"}" "$OUT"
     else
-      run_ffmpeg -i "$IN" -q:v 1 "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+      run_ffmpeg -i "$IN" -q:v 1 "${EXTRA_FFMPEG_ARGS[@]+"${EXTRA_FFMPEG_ARGS[@]}"}" "$OUT"
     fi
     ;;
   gif)
@@ -189,18 +265,24 @@ convert_to_image() {
       -vf "${vf},palettegen=stats_mode=full" /tmp/ttt_palette.png
     ffmpeg -hide_banner -loglevel error -y -i "$IN" -i /tmp/ttt_palette.png \
       -lavfi "${vf} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=3" \
-      "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+      "${EXTRA_FFMPEG_ARGS[@]+"${EXTRA_FFMPEG_ARGS[@]}"}" "$OUT"
     rm -f /tmp/ttt_palette.png
     ;;
   tif | tiff)
-    run_ffmpeg -i "$IN" -compression_level 0 "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+    run_ffmpeg -i "$IN" -compression_level 0 "${EXTRA_FFMPEG_ARGS[@]+"${EXTRA_FFMPEG_ARGS[@]}"}" "$OUT"
     ;;
   avif | heic)
-    run_ffmpeg -i "$IN" -q:v 1 "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+    run_ffmpeg -i "$IN" -q:v 1 "${EXTRA_FFMPEG_ARGS[@]+"${EXTRA_FFMPEG_ARGS[@]}"}" "$OUT"
     ;;
   svg)
-    log.error "SVG output not supported via ffmpeg; use inkscape or ImageMagick"
-    exit 1
+    if [[ "$IN_EXT" == "ai" ]]; then
+      guards.require_exec inkscape
+      ((verbose)) && log.info "Converting via inkscape"
+      inkscape "$IN" --export-type=svg --export-filename="$OUT" >/dev/null 2>&1
+    else
+      log.error "SVG output not supported via ffmpeg; use inkscape or ImageMagick"
+      exit 1
+    fi
     ;;
   *) log.error "Image output not supported: .$OUT_EXT"; exit 1 ;;
   esac
@@ -270,6 +352,13 @@ convert_docs() {
   esac
 }
 
+convert_fonts() {
+  ensure_out_dir
+  guards.require_exec fontforge
+  ((verbose)) && log.info "Converting via fontforge"
+  fontforge -lang=ff -c 'Open($1); Generate($2);' "$IN" "$OUT"
+}
+
 main() {
   parse_args "$@"
 
@@ -311,13 +400,20 @@ main() {
     convert_to_audio
   elif is_video_ext "$OUT_EXT"; then
     convert_to_video
+  elif is_font_ext "$OUT_EXT"; then
+    if is_font_ext "$IN_EXT"; then
+      convert_fonts
+    else
+      log.error "Font conversions require font input (.ttf/.otf/.woff/.woff2/.svg)"
+      exit 1
+    fi
   elif is_image_ext "$OUT_EXT"; then
     convert_to_image
   elif is_doc_ext "$OUT_EXT"; then
     convert_docs
   else
     ((verbose)) && log.info "Unknown output type; falling back to ffmpeg"
-    run_ffmpeg -i "$IN" "${EXTRA_FFMPEG_ARGS[@]}" "$OUT"
+    run_ffmpeg -i "$IN" "${EXTRA_FFMPEG_ARGS[@]+"${EXTRA_FFMPEG_ARGS[@]}"}" "$OUT"
   fi
 
   log.success "Created $OUT"

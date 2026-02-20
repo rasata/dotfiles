@@ -89,20 +89,20 @@ _path__splitext() {
   local name=$1
   # hidden files: ".env" => no suffix; ".a.rc" -> stem ".a", suffix ".rc"
   if [[ $name == .* && $name != *.* ]]; then
-    printf '%s %s\n' "$name" ''
+    printf '%s\t%s\n' "$name" ''
     return
   fi
   local base=${name##*/}
   local stem=${base%.*}
   local ext=${base#"$stem"}
-  if [[ -z $stem || $base == "$stem" ]]; then printf '%s %s\n' "$base" ''; else printf '%s %s\n' "$stem" "$ext"; fi
+  if [[ -z $stem || $base == "$stem" ]]; then printf '%s\t%s\n' "$base" ''; else printf '%s\t%s\n' "$stem" "$ext"; fi
 }
 
 # path.stem PATH (filename without final suffix)
 path.stem() {
   local base
   base=$(path.basename "$1")
-  read -r stem _ < <(_path__splitext "$base")
+  IFS=$'\t' read -r stem _ < <(_path__splitext "$base")
   printf '%s\n' "$stem"
 }
 
@@ -110,7 +110,7 @@ path.stem() {
 path.suffix() {
   local base
   base=$(path.basename "$1")
-  read -r _ ext < <(_path__splitext "$base")
+  IFS=$'\t' read -r _ ext < <(_path__splitext "$base")
   printf '%s\n' "$ext"
 }
 
@@ -140,7 +140,7 @@ path.with_suffix() {
   local base dir stem ext
   base=$(path.basename "$1")
   dir=$(path.dirname "$1")
-  read -r stem ext < <(_path__splitext "$base")
+  IFS=$'\t' read -r stem ext < <(_path__splitext "$base")
   if [[ -z $2 ]]; then printf '%s\n' "${dir:+$dir/}$stem"; else printf '%s\n' "${dir:+$dir/}$stem$2"; fi
 }
 

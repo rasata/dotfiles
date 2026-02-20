@@ -28,6 +28,9 @@ repo_root=$(cd "$script_dir/../.." &>/dev/null && pwd -P)
 BREWFILE_PATH="$script_dir/Brewfile"
 DEFAULTS_FILE="$script_dir/defaults.conf"
 DOCK_FILE="$script_dir/dock.conf"
+BOOTSTRAP_SCRIPT="$script_dir/bootstrap-brew-python"
+COPYX_CONFIG_DEFAULT="$HOME/.config/copyx/config.yml"
+CURSOR_BUNDLE_ID="com.todesktop.230313mzl4w4u92"
 
 verbose=0
 assume_yes=0
@@ -116,6 +119,35 @@ compact_path() {
   else
     echo "$value"
   fi
+}
+
+require_macos() {
+  if ! os.platform.is_darwin; then
+    log.error "This provisioner only supports macOS (detected: $(sys.platform))"
+    return 1
+  fi
+  return 0
+}
+
+retry.run() {
+  local attempts="$1"
+  local delay_seconds="$2"
+  shift 2
+
+  local attempt=1 exit_code=0
+  while true; do
+    if "$@"; then
+      return 0
+    fi
+    exit_code=$?
+    if ((attempt >= attempts)); then
+      return "$exit_code"
+    fi
+    log.warn "Command failed (attempt ${attempt}/${attempts}): $*; retrying in ${delay_seconds}s"
+    sleep "$delay_seconds"
+    attempt=$((attempt + 1))
+    delay_seconds=$((delay_seconds * 2))
+  done
 }
 
 macos_defaults_load() {
@@ -263,23 +295,23 @@ ensure_directory_flag() {
   if [[ $desired == "hidden" ]]; then
     if directory_is_hidden "$path"; then
       ((verbose)) && log.info "$path already hidden"
-      return
+      return 0
     fi
     summary.add "Hide $path"
     if ((dry_run)); then
       log.info "[dry-run] Would hide $path"
-      return
+      return 0
     fi
     chflags hidden "$path"
   else
     if ! directory_is_hidden "$path"; then
       ((verbose)) && log.info "$path already visible"
-      return
+      return 0
     fi
     summary.add "Unhide $path"
     if ((dry_run)); then
       log.info "[dry-run] Would unhide $path"
-      return
+      return 0
     fi
     chflags nohidden "$path"
   fi
@@ -294,6 +326,28 @@ brew_prefix_actual() {
     brew --prefix 2>/dev/null || preferred_brew_prefix
   else
     preferred_brew_prefix
+  fi
+}
+
+ensure_python3_via_brew() {
+  if command -v python3 >/dev/null 2>&1; then
+    ((verbose)) && log.info "python3 already installed"
+    return 0
+  fi
+
+  summary.add "Install Python 3 via Homebrew"
+  if ((dry_run)); then
+    log.info "[dry-run] Would run: brew install python"
+    return 0
+  fi
+
+  if ! brew_exists; then
+    summary.warn "Homebrew not available; cannot install Python 3"
+    return 0
+  fi
+
+  if ! brew_capture "brew install python" brew install python; then
+    summary.warn "Failed to install Python 3 via Homebrew"
   fi
 }
 
@@ -401,8 +455,14 @@ step_setup_xcode() {
     else
       log.info "Triggering Xcode Command Line Tools installer"
       xcode-select --install >/dev/null 2>&1 || log.warn "Installer may already be running"
+      local waited=0 timeout_seconds=1800
       until xcode-select -p >/dev/null 2>&1; do
         sleep 10
+        waited=$((waited + 10))
+        if ((waited >= timeout_seconds)); then
+          summary.warn "Timed out waiting for Xcode Command Line Tools installation"
+          break
+        fi
       done
     fi
   else
@@ -422,8 +482,37 @@ step_setup_xcode() {
 }
 
 step_setup_homebrew() {
+  if brew_exists && command -v python3 >/dev/null 2>&1; then
+    ((verbose)) && log.info "Homebrew and python3 already present"
+    return 0
+  fi
+
+  if [[ -x $BOOTSTRAP_SCRIPT ]]; then
+    if ((dry_run)); then
+      log.info "[dry-run] Would run: $BOOTSTRAP_SCRIPT"
+      summary.add "Bootstrap Homebrew and Python"
+      return 0
+    fi
+
+    local -a bootstrap_args=()
+    ((verbose)) && bootstrap_args+=("--verbose")
+    if "$BOOTSTRAP_SCRIPT" "${bootstrap_args[@]}"; then
+      summary.add "Bootstrapped Homebrew and Python"
+      if brew_exists; then
+        local bootstrap_prefix
+        bootstrap_prefix=$(brew_prefix_actual)
+        PATH="$bootstrap_prefix/bin:$PATH"
+        export PATH
+      fi
+      ensure_python3_via_brew
+      return 0
+    fi
+    summary.warn "Bootstrap script failed; falling back to inline Homebrew install"
+  fi
+
   if brew_exists; then
     ((verbose)) && log.info "Homebrew detected at $(brew_prefix_actual)"
+    ensure_python3_via_brew
     return 0
   fi
 
@@ -433,16 +522,27 @@ step_setup_homebrew() {
 
   if ((dry_run)); then
     log.info "[dry-run] Would install Homebrew and adjust PATH"
+    log.info "[dry-run] Would install python3 via Homebrew"
     return 0
   fi
 
   ensure_homebrew_prefix_permissions "$prefix"
-  /bin/bash -c "$(curl -fsSL "$installer")"
+  local installer_file
+  installer_file=$(mktemp)
+  if ! retry.run 3 2 curl -fsSL "$installer" -o "$installer_file"; then
+    rm -f "$installer_file"
+    summary.warn "Failed to download Homebrew installer"
+    return 0
+  fi
+  NONINTERACTIVE=1 /bin/bash "$installer_file" || summary.warn "Homebrew installer exited non-zero"
+  rm -f "$installer_file"
 
   if [[ -x "$prefix/bin/brew" ]]; then
     PATH="$prefix/bin:$PATH"
     export PATH
   fi
+
+  ensure_python3_via_brew
 }
 
 step_ensure_brew_bundle() {
@@ -482,6 +582,7 @@ step_setup_default_file_associations() {
 
   if ((dry_run)); then
     log.info "[dry-run] Would refresh default file associations with duti"
+    log.info "[dry-run] Would set shell script associations to Cursor"
     return 0
   fi
 
@@ -491,14 +592,24 @@ step_setup_default_file_associations() {
   fi
 
   summary.add "Refresh default file associations via duti"
-  if ! ui.loader.run "Refreshing file associations" -- bash -c '
+  if ! CURSOR_BUNDLE_ID="$CURSOR_BUNDLE_ID" ui.loader.run "Refreshing file associations" -- bash -c '
     set -euo pipefail
     curl -fsSL "https://raw.githubusercontent.com/github/linguist/master/lib/linguist/languages.yml" \
       | yq e "to_entries | (map(.value.extensions) | flatten) - [null] | unique | .[]" \
-      | xargs -L 1 -I {} duti -s com.todesktop.230313mzl4w4u92 {} all
+      | sed -E "s/^\.//" \
+      | xargs -L 1 -I {} duti -s "$CURSOR_BUNDLE_ID" {} all
   '; then
     summary.warn "Failed to update file associations"
   fi
+
+  local target
+  local -a shell_targets=("public.shell-script" "public.unix-executable" "sh" "bash" "zsh" "ksh" "command")
+  for target in "${shell_targets[@]}"; do
+    if ! duti -s "$CURSOR_BUNDLE_ID" "$target" all >/dev/null 2>&1; then
+      summary.warn "Failed to set Cursor default for shell target: $target"
+    fi
+  done
+  summary.add "Set Cursor as default app for shell scripts"
 }
 
 step_apply_user_defaults() {
@@ -774,23 +885,50 @@ step_install_pipx() {
 
 step_configure_copyx_launchd() {
   local copyx_bin="$repo_root/bin/copyx"
+  local copyx_config="${COPYX_CONFIG:-$COPYX_CONFIG_DEFAULT}"
+  copyx_config=$(expand_path "$copyx_config")
 
   if [[ ! -x $copyx_bin ]]; then
     summary.warn "copyx helper missing at $copyx_bin; skipping LaunchAgent setup"
     return 0
   fi
 
+  if [[ ! -f $copyx_config ]]; then
+    summary.warn "copyx config not found at $copyx_config; skipping LaunchAgent setup"
+    return 0
+  fi
+
+  if ! command -v yq >/dev/null 2>&1; then
+    summary.warn "yq not installed; skipping copyx LaunchAgent setup"
+    return 0
+  fi
+
+  local backup_root
+  backup_root=$(yq eval -r '.backup_root // ""' "$copyx_config" 2>/dev/null || true)
+  backup_root=$(str.trim "$backup_root")
+  if [[ -z $backup_root ]]; then
+    summary.warn "copyx backup_root is not configured in $copyx_config; skipping LaunchAgent setup"
+    return 0
+  fi
+
+  local sources_count
+  sources_count=$(yq eval -r '(.sources // []) | length' "$copyx_config" 2>/dev/null || echo "0")
+  if ! [[ $sources_count =~ ^[0-9]+$ ]] || ((sources_count == 0)); then
+    summary.warn "copyx sources list is empty in $copyx_config; skipping LaunchAgent setup"
+    return 0
+  fi
+
   if ((dry_run)); then
-    log.info "[dry-run] Would run: $copyx_bin --launchd-load"
+    log.info "[dry-run] Would run: $copyx_bin --config $copyx_config --launchd-load"
     summary.add "Load copyx LaunchAgent"
     return 0
   fi
 
-  if "$copyx_bin" --launchd-load; then
+  if "$copyx_bin" --config "$copyx_config" --launchd-load; then
     summary.add "Loaded copyx LaunchAgent"
   else
     summary.warn "Failed to load copyx LaunchAgent"
-    return 1
+    return 0
   fi
 }
 
@@ -896,6 +1034,7 @@ parse_args() {
 
 main() {
   parse_args "$@"
+  require_macos || return 1
 
   if ((update_brewfile)); then
     update_brewfile_from_system
@@ -920,7 +1059,7 @@ main() {
 
   run_step "Request sudo keep-alive" step_sudo_keepalive
   run_step "Install Xcode Command Line Tools" step_setup_xcode
-  run_step "Ensure Homebrew" step_setup_homebrew
+  run_step "Ensure Homebrew and Python" step_setup_homebrew
   run_step "Apply Brew bundle" step_ensure_brew_bundle
   run_step "Refresh file associations" step_setup_default_file_associations
   run_step "Apply macOS defaults" step_apply_user_defaults

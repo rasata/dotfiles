@@ -7,7 +7,7 @@
 #/    -h, --help        Print this help and exit
 #/    -v, --verbose     Enable verbose output
 #/    -n, --dry-run     Run rsync in dry-run mode
-#/    -i, --interval    Seconds between iterations (default 5 hours)
+#/    -i, --interval    Seconds between iterations (default 1 hour)
 #/        --config      Path to YAML config (or COPYX_CONFIG env var)
 #/        --oneshot     Run a single iteration then exit
 #/        --launchd-load    Write LaunchAgent plist and load via launchctl
@@ -25,11 +25,29 @@
 #/    max_size_bytes  Optional per-file size limit; larger files are skipped
 
 set -Eeuo pipefail
-source "$(dirname "$0")/../lib/bash/initrc"
+
+script_source="${BASH_SOURCE[0]}"
+script_dir=$(cd "$(dirname -- "$script_source")" && pwd -P)
+initrc_candidates=(
+  "$script_dir/../lib/bash/initrc"
+  "$script_dir/../../lib/bash/initrc"
+)
+initrc_path=""
+for candidate in "${initrc_candidates[@]}"; do
+  if [[ -f $candidate ]]; then
+    initrc_path="$candidate"
+    break
+  fi
+done
+if [[ -z $initrc_path ]]; then
+  printf '[ERROR] Unable to locate lib/bash/initrc from %s\n' "$script_source" >&2
+  exit 1
+fi
+source "$initrc_path"
 
 verbose=0
 dry_run=0
-interval=18000
+interval=3600
 oneshot=0
 should_exit=0
 config_path="${COPYX_CONFIG:-}"
@@ -39,6 +57,7 @@ interrupted=0
 
 readonly LAUNCHD_LABEL="com.nficano.copyx"
 readonly LAUNCHD_PATH_VALUE="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+readonly COPYX_LOG_TAG="${COPYX_LOG_TAG:-copyx}"
 
 config_dir=""
 config_backup_root=""
@@ -50,6 +69,25 @@ machine_dir=""
 config_max_size_bytes=0
 declare -a rsync_exclude_patterns=()
 declare -a s3_exclude_patterns=()
+
+copyx.unified_log() {
+  local level="$1"
+  shift || true
+  local message="$*"
+  [[ -n $message ]] || return 0
+  if ! command -v logger >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local priority="user.notice"
+  case "$level" in
+  error) priority="user.err" ;;
+  warn) priority="user.warning" ;;
+  info) priority="user.notice" ;;
+  esac
+
+  logger -t "$COPYX_LOG_TAG" -p "$priority" -- "$message" >/dev/null 2>&1 || true
+}
 
 cleanup() {
   script.cleanup
@@ -448,14 +486,12 @@ load_config() {
 
   config_backup_root=$(yaml.read_string "$file" '.backup_root')
   config_backup_root=$(str.trim "$config_backup_root")
-  config_backup_root=$("$config_backup_root")
   if [[ -n ${COPYX_BACKUP_ROOT:-} ]]; then
-    config_backup_root=$("$COPYX_BACKUP_ROOT")
+    config_backup_root=$(path.expand "$COPYX_BACKUP_ROOT")
   fi
 
   config_machine_id=$(yaml.read_string "$file" '.machine_id')
   config_machine_id=$(str.trim "$config_machine_id")
-  config_machine_id=$("$config_machine_id")
 
   config_max_size_bytes=0
 
@@ -569,6 +605,7 @@ run_backup_iteration() {
 
   if ((dry_run)); then
     printf '[INFO] Dry run complete; backup would sync to %s\n' "$machine_dir"
+    copyx.unified_log info "copyx dry-run complete destination=$machine_dir"
     return 0
   fi
 
@@ -589,18 +626,22 @@ run_backup_iteration() {
   if ((interrupted)); then
     if [[ ${#failed[@]} -gt 0 ]]; then
       printf '[WARN] Iteration aborted with %d incomplete %s operations\n' "${#failed[@]}" "$backup_backend"
+      copyx.unified_log warn "copyx iteration interrupted with ${#failed[@]} incomplete operations backend=$backup_backend"
     else
       printf '[WARN] Iteration aborted before completion\n'
+      copyx.unified_log warn "copyx iteration interrupted before completion"
     fi
     return 1
   fi
 
   if [[ ${#failed[@]} -gt 0 ]]; then
     printf '[ERROR] Iteration completed with %d failed %s operations\n' "${#failed[@]}" "$backup_backend"
+    copyx.unified_log error "copyx iteration failed failed_operations=${#failed[@]} backend=$backup_backend destination=$machine_dir"
     return 1
   fi
 
   printf '[OK] Backup complete: synced %d source(s) to %s\n' "${#sources[@]}" "$machine_dir"
+  copyx.unified_log info "copyx backup complete sources=${#sources[@]} backend=$backup_backend destination=$machine_dir"
 }
 
 sleep_until_interrupt() {
@@ -731,7 +772,12 @@ load_launchd_agent() {
   log_dir=$(launchd.logs_dir "copyx")
   script_source="${BASH_SOURCE[0]}"
   script_dir=$(cd "$(dirname -- "$script_source")" && pwd -P)
-  script_path=$(path.resolve "$(basename -- "$script_source")" "$script_dir")
+  local wrapper_candidate="$script_dir/../copyx"
+  if [[ -x $wrapper_candidate ]]; then
+    script_path=$(path.resolve "$wrapper_candidate")
+  else
+    script_path=$(path.resolve "$(basename -- "$script_source")" "$script_dir")
+  fi
   local stdout_path="$log_dir/stdout.log" stderr_path="$log_dir/stderr.log"
 
   if ! launchd.write_agent_plist \
@@ -747,6 +793,7 @@ load_launchd_agent() {
   domain=$(launchd.user_domain)
   if ! launchd.bootstrap_agent "$LAUNCHD_LABEL" "$plist_path" "$domain" "$verbose"; then return 1; fi
   printf '[INFO] LaunchAgent %s active (config: %s)\n' "$LAUNCHD_LABEL" "$config"
+  copyx.unified_log info "copyx launchd loaded label=$LAUNCHD_LABEL config=$config interval=$start_interval"
 }
 
 unload_launchd_agent() {
@@ -756,6 +803,7 @@ unload_launchd_agent() {
   local domain
   domain=$(launchd.user_domain)
   if ! launchd.unload_agent "$LAUNCHD_LABEL" "$plist_path" "$domain" "$verbose"; then return 1; fi
+  copyx.unified_log info "copyx launchd unloaded label=$LAUNCHD_LABEL"
 }
 
 main() {
@@ -772,12 +820,14 @@ main() {
 
   if [[ -z $config_path ]]; then
     printf '[ERROR] No config provided; use --config or set COPYX_CONFIG\n'
+    copyx.unified_log error "copyx failed to start: missing config path"
     exit 1
   fi
 
   config_path=$(path.resolve "$config_path" "$PWD")
   [[ -f $config_path ]] || {
     printf '[ERROR] Config path not found: %s\n' "$config_path"
+    copyx.unified_log error "copyx failed to start: config path not found path=$config_path"
     exit 1
   }
 
@@ -789,14 +839,17 @@ main() {
     if ! run_backup_iteration "$config_path"; then
       if ((interrupted)); then
         printf '[WARN] Iteration %d interrupted\n' "$iteration"
+        copyx.unified_log warn "copyx iteration interrupted iteration=$iteration"
       else
         printf '[ERROR] Iteration %d failed\n' "$iteration"
+        copyx.unified_log error "copyx iteration failed iteration=$iteration"
       fi
     fi
 
     if ((oneshot)); then break; fi
     if ((should_exit)); then
       printf '[INFO] Exit requested; stopping loop\n'
+      copyx.unified_log info "copyx exit requested; stopping"
       break
     fi
 
@@ -804,11 +857,15 @@ main() {
 
     if ((should_exit)); then
       printf '[INFO] Exit requested after sleep\n'
+      copyx.unified_log info "copyx exit requested after sleep"
       break
     fi
   done
 
-  ((interrupted)) && return 130
+  if ((interrupted)); then
+    copyx.unified_log warn "copyx terminated by signal"
+    return 130
+  fi
 }
 
 parse_args "$@"

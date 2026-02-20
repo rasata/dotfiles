@@ -6,7 +6,7 @@
 # Use the optional `exclude` section to skip matching paths during syncs.
 # Set `max_size_bytes` to skip files larger than the specified number of bytes.
 
-#backup_root:
+backup_root: $HOME/.backup/copyx
 max_size_bytes: 52428800  # 50 MiB
 
 sources:

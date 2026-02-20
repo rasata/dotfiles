@@ -18,7 +18,7 @@ yaml.read_list() {
     trimmed=$(str.trim "$line")
     [[ -z $trimmed || $trimmed == "null" ]] && continue
     if ((expand_env)); then
-      value=$("$trimmed")
+      value=$(path.expand "$trimmed")
     else
       value="$trimmed"
     fi
@@ -39,7 +39,7 @@ yaml.read_string() {
     value="$default_value"
   fi
   if ((expand_env)); then
-    value=$("$value")
+    value=$(path.expand "$value")
   fi
   printf '%s\n' "$value"
 }

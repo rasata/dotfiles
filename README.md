@@ -21,7 +21,7 @@ This repository collects personal macOS/Linux dotfiles, provisioning scripts, an
 - Applies configuration with loaders/spinners while writing defaults, refreshing file associations, and regenerating Brewfiles so long-running steps stay responsive.
 - Reads desired user defaults from `setup/macos/defaults.conf` (`domain|key|type|value`). Use `setup/macos/mac-provision --update-defaults` to rewrite the file from current system settings (dropping keys that no longer resolve) or edit it manually to add more defaults.
 - Keeps Homebrew aligned with `setup/macos/Brewfile`; run `setup/macos/mac-provision --update-brewfile` to dump the current system state back into the repo, or `--update-only` to perform configuration dumps without provisioning.
-- Ensures the following during a full run: Xcode CLI tools and license acceptance, Homebrew installation, Brew bundle reconciliation, duti-based file associations, curated macOS defaults (keyboard repeat, Finder/Dock tweaks, Bluetooth audio quality, screenshot location, etc.), vendor directory visibility, `pipx` installation, and enabling the application firewall.
+- Ensures the following during a full run: Xcode CLI tools and license acceptance, Homebrew + Python bootstrap (`setup/macos/bootstrap-brew-python`), Brew bundle reconciliation, duti-based file associations (including Cursor as the default app for shell scripts), curated macOS defaults (keyboard repeat, Finder/Dock tweaks, Bluetooth audio quality, screenshot location, etc.), vendor directory visibility, `pipx` installation, copyx LaunchAgent loading (when configured), and enabling the application firewall.
 
 Combine the flags to suit your workflow. Examples:
 
@@ -57,6 +57,7 @@ setup/macos/mac-provision --yes --non-interactive
 - **`uv-init-helper`** - Wraps the `uv` Python tool: for `uv init` it creates or reuses a virtualenv recorded in `.envrc`, otherwise it forwards all arguments to the real binary
 
 ### File and Directory Tools
+
 - **`copyx`** - Simple backup automation to S3.
 - **`s3-upload-and-link`** - Upload files to S3 and copy the shareable URL to the clipboard (similar to CloudApp)
 - **`path-resolve`** - Resolves a relative path to an absolute path (`path-resolve ../some/file`)
@@ -152,29 +153,29 @@ These scripts implement Redis-inspired operations backed by the helper sourced f
 - **Configuration** - The config supports `backup_root` (local path or `s3://` URI), optional `machine_id`, `sources`, `exclude` patterns, and `max_size_bytes` to skip files above a byte threshold. When `backup_root` targets the filesystem, `copyx` shells out to `rsync`; S3 destinations use `aws s3 sync/cp` with the same include/exclude semantics.
 - **Machine scoping** - If `machine_id` is omitted, the helper reads `~/.machine_id` (populated by `setup/macos/mac-provision`) and falls back to the current hostname. Each run writes into a `<machine_id>/` subdirectory so multiple hosts can share the same backup bucket.
 - **Scheduling** - `copyx --interval <seconds>` keeps a loop running (default 3600s). `copyx --launchd-load` generates `~/Library/LaunchAgents/com.nficano.copyx.plist`, bootstraps it with `launchctl`, and tails logs under `~/Library/Logs/copyx`. Use `--launchd-unload` to tear it down.
+- **Console logging** - copyx writes lifecycle/health events to macOS unified logs via `logger` with tag `copyx`, so entries are visible in Console.app.
 - **Spot runs** - `copyx --oneshot` executes a single pass; add `--dry-run` or `--verbose` to inspect the planned rsync/S3 operations before committing.
 - **Inspection tools** - `copyx --preview /path/to/dir` prints the files from that subtree that would be included or skipped after applying exclude rules. `--show-files` emits the same include/skip summary for every configured source before syncing (override the default 200-line cap with `--show-files=all` or `COPYX_SHOW_FILES_LIMIT`).
 - **Progress & cleanup** - `--progress` enables per-file progress output for both rsync and S3. `--purge-backup --yes` wipes the current machine’s destination directory or bucket prefix, with `--dry-run` available for a safety check.
 
-
 ### Environment Variables
 
-| Name | Required | Description | Default |
-|------|-----------|-------------|----------|
-| `COPYX_CONFIG` | ✓ | Path to YAML config file.| — |
+| Name           | Required | Description               | Default |
+| -------------- | -------- | ------------------------- | ------- |
+| `COPYX_CONFIG` | ✓        | Path to YAML config file. | —       |
 
 #### Configuration options
-| Name | Required | Description | Default |
-|------|-----------|-------------|----------|
-| `backup_root` | ✓ | Destination directory (path or `s3://` URI) for synced data. | — |
-| `machine_id` | ✗ | Host directory in `backup_root` (supports a `.machine_id` file in `$HOME` directory.) | `$(hostname)` |
-| `sources` | ✓ | List of paths/globs to backup. | — |
-| `exclude` | ✓ | List of paths/globs to exclude. | — |
-| `max_size_bytes` | ✗ | Excludes large files.  | `-inf` |
 
-
+| Name             | Required | Description                                                                           | Default       |
+| ---------------- | -------- | ------------------------------------------------------------------------------------- | ------------- |
+| `backup_root`    | ✓        | Destination directory (path or `s3://` URI) for synced data.                          | —             |
+| `machine_id`     | ✗        | Host directory in `backup_root` (supports a `.machine_id` file in `$HOME` directory.) | `$(hostname)` |
+| `sources`        | ✓        | List of paths/globs to backup.                                                        | —             |
+| `exclude`        | ✓        | List of paths/globs to exclude.                                                       | —             |
+| `max_size_bytes` | ✗        | Excludes large files.                                                                 | `-inf`        |
 
 ### Sample config file:
+
 ```yaml
 # Example configuration for the copyx utility.
 #
@@ -185,7 +186,6 @@ These scripts implement Redis-inspired operations backed by the helper sourced f
 # Use the optional `exclude` section to skip matching paths during syncs.
 # Set `max_size_bytes` to skip files larger than the specified number of bytes.
 
-
 #/    backup_root   Destination directory (path or s3:// URI) for synced data
 #/    machine_id    Optional machine identifier (hostname used if omitted)
 #/    sources       List of paths/globs to replicate
@@ -194,7 +194,7 @@ These scripts implement Redis-inspired operations backed by the helper sourced f
 
 backup_root: s3://s3.us-east-1.amazonaws.com/mybucket
 # machine_id:
-max_size_bytes: 52428800  # 50 MiB
+max_size_bytes: 52428800 # 50 MiB
 sources:
   - $HOME/Desktop
   - /etc/hosts
@@ -203,19 +203,19 @@ sources:
   - $HOME/.profile.local
   - $HOME/.ssh
 exclude:
-  - '**/.cache'
-  - '**/.DS_Store'
-  - '**/.dump'
-  - '**/.git'
-  - '**/tmp'
+  - "**/.cache"
+  - "**/.DS_Store"
+  - "**/.dump"
+  - "**/.git"
+  - "**/tmp"
 ```
-
 
 ## Spell Correct
 
 `spell-correct' is spell check and correction utility that uses ChatGPT for spelling correction.
 
 **Usage**
+
 ```bash
 spell-correct leasure
 # Copied correction "leisure" to the clipboard
@@ -223,20 +223,21 @@ spell-correct leasure
 
 #### Environment Variables
 
-| Name | Required | Description | Default |
-|------|-----------|-------------|----------|
-| `OPENAI_API_KEY` | ✓ | Your OpenAI API key used for authentication. | — |
-| `SPELL_CORRECT_OPENAI_MODEL` | ✗ | Model used for correction. | `gpt-4o-mini` |
-| `SPELL_CORRECT_OPENAI_AGENT` | ✗ | Agent name defined in `.agents` file. | `spell-check` |
-| `SPELL_CORRECT_OPENAI_TEMPERATURE` | ✗ | Controls randomness of model output. | `0` |
+| Name                               | Required | Description                                  | Default       |
+| ---------------------------------- | -------- | -------------------------------------------- | ------------- |
+| `OPENAI_API_KEY`                   | ✓        | Your OpenAI API key used for authentication. | —             |
+| `SPELL_CORRECT_OPENAI_MODEL`       | ✗        | Model used for correction.                   | `gpt-4o-mini` |
+| `SPELL_CORRECT_OPENAI_AGENT`       | ✗        | Agent name defined in `.agents` file.        | `spell-check` |
+| `SPELL_CORRECT_OPENAI_TEMPERATURE` | ✗        | Controls randomness of model output.         | `0`           |
 
 ---
 
 ### Autoflags
 
-`autoflags` converts natural language intents into safe shell commands. *(Work in progress.)*
+`autoflags` converts natural language intents into safe shell commands. _(Work in progress.)_
 
 **Usage**
+
 ```bash
 autoflags git "rename current branch to feature/xyz"
 # git branch -m feature/xyz
@@ -253,20 +254,20 @@ autoflags ffmpeg "convent input.mov to output.webm"
 
 #### Environment Variables
 
-| Name | Required | Description | Default |
-|------|-----------|-------------|----------|
-| `OPENAI_API_KEY` | ✓ | Your OpenAI API key used for authentication. | — |
-| `AUTOFLAGS_YES` | ✗ | Run without confirmation prompt. | `false` |
-| `AUTOFLAGS_PRINT` | ✗ | Show suggested command without executing. | `false` |
-| `AUTOFLAGS_COPY` | ✗ | Copy command to clipboard (implies `AUTOFLAGS_PRINT=true`). | `false` |
-| `AUTOFLAGS_ALLOW_ALT` | ✗ | Allow AI to suggest alternate tools or commands. | — |
-| `AUTOFLAGS_CONFIRM_DEFAULT` | ✗ | Default answer when prompted (Y or N). | `N` |
-| `AUTOFLAGS_REQUIRE_WHICH` | ✗ | Verify that suggested alternative command exists. | `false` |
-| `AUTOFLAGS_NO_CLIPBOARD` | ✗ | Disable automatic clipboard copy. | `false` |
-| `AUTOFLAGS_CONTEXT` | ✗ | Add extra context to AI prompt. | — |
-| `AUTOFLAGS_OPENAI_MODEL` | ✗ | Model used for generation. | `gpt-4o-mini` |
-| `AUTOFLAGS_OPENAI_AGENT` | ✗ | Agent name defined in `.agents` file. | `autoflags` |
-| `AUTOFLAGS_OPENAI_TEMPERATURE` | ✗ | Controls randomness of model output. | `0` |
+| Name                           | Required | Description                                                 | Default       |
+| ------------------------------ | -------- | ----------------------------------------------------------- | ------------- |
+| `OPENAI_API_KEY`               | ✓        | Your OpenAI API key used for authentication.                | —             |
+| `AUTOFLAGS_YES`                | ✗        | Run without confirmation prompt.                            | `false`       |
+| `AUTOFLAGS_PRINT`              | ✗        | Show suggested command without executing.                   | `false`       |
+| `AUTOFLAGS_COPY`               | ✗        | Copy command to clipboard (implies `AUTOFLAGS_PRINT=true`). | `false`       |
+| `AUTOFLAGS_ALLOW_ALT`          | ✗        | Allow AI to suggest alternate tools or commands.            | —             |
+| `AUTOFLAGS_CONFIRM_DEFAULT`    | ✗        | Default answer when prompted (Y or N).                      | `N`           |
+| `AUTOFLAGS_REQUIRE_WHICH`      | ✗        | Verify that suggested alternative command exists.           | `false`       |
+| `AUTOFLAGS_NO_CLIPBOARD`       | ✗        | Disable automatic clipboard copy.                           | `false`       |
+| `AUTOFLAGS_CONTEXT`            | ✗        | Add extra context to AI prompt.                             | —             |
+| `AUTOFLAGS_OPENAI_MODEL`       | ✗        | Model used for generation.                                  | `gpt-4o-mini` |
+| `AUTOFLAGS_OPENAI_AGENT`       | ✗        | Agent name defined in `.agents` file.                       | `autoflags`   |
+| `AUTOFLAGS_OPENAI_TEMPERATURE` | ✗        | Controls randomness of model output.                        | `0`           |
 
 ---
 
@@ -275,6 +276,7 @@ autoflags ffmpeg "convent input.mov to output.webm"
 Uploads a file to S3 and copies the shareable URL to your clipboard.
 
 **Usage**
+
 ```bash
 s3-upload-and-link ubuntu-24.04.3-desktop-amd64.iso
 # https://s3.us-east-1.amazonaws.com/mybucket/9oe3HVzO.iso
@@ -282,18 +284,17 @@ s3-upload-and-link ubuntu-24.04.3-desktop-amd64.iso
 
 #### Environment Variables
 
-| Name | Required | Description | Default |
-|------|-----------|-------------|----------|
-| `S3_UPLOAD_LINK_BUCKET` | ✓ | S3 bucket name (supports optional `s3://` prefix). | — |
-| `S3_UPLOAD_LINK_PREFIX` | ✗ | Optional key prefix for uploaded objects. | — |
-| `S3_UPLOAD_LINK_URL_BASE` | ✗ | Base HTTPS URL used to construct share links. | — |
-| `S3_UPLOAD_LINK_BUCKET_REGION` | ✗ | Region used for default URL generation. | — |
-| `S3_UPLOAD_LINK_ACL` | ✗ | ACL for `aws s3 cp`. | `public-read` |
-| `S3_UPLOAD_LINK_CACHE_CONTROL` | ✗ | `Cache-Control` header for uploaded object. | — |
-| `S3_UPLOAD_LINK_CONTENT_TYPE` | ✗ | Explicit `Content-Type` override. | — |
-| `S3_UPLOAD_LINK_ID_LENGTH` | ✗ | Length of generated NanoID filename. | `12` |
-| `S3_UPLOAD_LINK_EXPIRES_IN` | ✗ | Expiration time in seconds for uploaded object. | — |
-
+| Name                           | Required | Description                                        | Default       |
+| ------------------------------ | -------- | -------------------------------------------------- | ------------- |
+| `S3_UPLOAD_LINK_BUCKET`        | ✓        | S3 bucket name (supports optional `s3://` prefix). | —             |
+| `S3_UPLOAD_LINK_PREFIX`        | ✗        | Optional key prefix for uploaded objects.          | —             |
+| `S3_UPLOAD_LINK_URL_BASE`      | ✗        | Base HTTPS URL used to construct share links.      | —             |
+| `S3_UPLOAD_LINK_BUCKET_REGION` | ✗        | Region used for default URL generation.            | —             |
+| `S3_UPLOAD_LINK_ACL`           | ✗        | ACL for `aws s3 cp`.                               | `public-read` |
+| `S3_UPLOAD_LINK_CACHE_CONTROL` | ✗        | `Cache-Control` header for uploaded object.        | —             |
+| `S3_UPLOAD_LINK_CONTENT_TYPE`  | ✗        | Explicit `Content-Type` override.                  | —             |
+| `S3_UPLOAD_LINK_ID_LENGTH`     | ✗        | Length of generated NanoID filename.               | `12`          |
+| `S3_UPLOAD_LINK_EXPIRES_IN`    | ✗        | Expiration time in seconds for uploaded object.    | —             |
 
 ## Skeleton Files (`skel/`)
 
